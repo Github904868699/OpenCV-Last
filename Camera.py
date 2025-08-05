@@ -58,9 +58,65 @@ def start_server(host="0.0.0.0", port=9760, on_message=lambda x: None):
 class CamScanner(QtCore.QThread):
     resultReady = QtCore.pyqtSignal(list)
 
+    def __init__(self, backend=cv2.CAP_MSMF, parent=None):
+        super().__init__(parent)
+        self.backend = backend
+
     def run(self):
-        cams = list_camera_indices()
+        cams = list_camera_indices(backend=self.backend)
         self.resultReady.emit(cams)
+
+
+class CameraWorker(QtCore.QThread):
+    frame_ready = QtCore.pyqtSignal(object)
+
+    def __init__(self, idx: int, backend: int, parent=None):
+        super().__init__(parent)
+        self.idx = idx
+        self.backend = backend
+        self.capture = None
+        self._running = True
+        self.fail_count = 0
+
+    def open_capture(self):
+        if self.capture:
+            self.capture.release()
+        self.capture = cv2.VideoCapture(self.idx, self.backend)
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        if not self.capture.isOpened() and self.backend != cv2.CAP_ANY:
+            print(f"[摄像头] 后端 {self.backend} 打开失败，尝试默认后端")
+            self.capture.release()
+            self.capture = cv2.VideoCapture(self.idx, cv2.CAP_ANY)
+            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    def run(self):
+        self.open_capture()
+        while self._running:
+            if not self.capture or not self.capture.isOpened():
+                self.open_capture()
+                self.msleep(100)
+                continue
+            ok, frame = self.capture.read()
+            if not ok or frame is None or frame.size == 0:
+                self.fail_count += 1
+                if self.fail_count > 5:
+                    print("[摄像头] 读取失败，尝试重新初始化")
+                    self.open_capture()
+                    self.fail_count = 0
+                self.msleep(10)
+                continue
+            self.fail_count = 0
+            self.frame_ready.emit(frame)
+            self.msleep(1)
+
+    def stop(self):
+        self._running = False
+        self.wait()
+        if self.capture:
+            self.capture.release()
+            self.capture = None
 
 
 # 辅助函数: 资源路径 (兼容 PyInstaller)
@@ -343,16 +399,24 @@ class MainWindow(QtWidgets.QWidget):
 
         self._init_controls()
         self.load_cmd_map()
-
         # 摄像头初始化
-        self.capture = None
+        self.worker = None
+        self.last_frame = None
+        # 摄像头后端可通过 camera.json 配置，例如 {"backend": "CAP_V4L2"}
+        self.cam_backend = cv2.CAP_MSMF if sys.platform.startswith("win") else cv2.CAP_ANY
+        cfg_path = Path("camera.json")
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    name = data.get("backend")
+                    if name and hasattr(cv2, name):
+                        self.cam_backend = int(getattr(cv2, name))
+            except Exception as e:
+                print(f"[摄像头] 读取配置失败: {e}")
         self.cam_combo.currentIndexChanged.connect(self.open_camera)
         self.open_camera()
 
-        # 定时器
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.on_timer)
-        self.timer.start(30)
         self.frame_cnt = 0
         self.tcp_msg_sig.connect(self._process_tcp_msg)
         self.svr = start_server(on_message=self.handle_tcp_msg)
@@ -362,7 +426,7 @@ class MainWindow(QtWidgets.QWidget):
     def start_scanning(self):
         if getattr(self, 'scanner', None) and self.scanner.isRunning():
             return
-        self.scanner = CamScanner(self)
+        self.scanner = CamScanner(self.cam_backend, self)
         self.scanner.resultReady.connect(self._populate_cameras_async)
         self.scanner.start()
 
@@ -423,15 +487,12 @@ class MainWindow(QtWidgets.QWidget):
         return {"dsID": "www.hc-system.com.cam", "models": []}
 
     def do_capture_and_send(self, cam_id: int):
-        if not self.capture or not self.capture.isOpened():
+        if self.last_frame is None:
             print("[摄像头] 未就绪")
             return
         if cam_id != self.cam_combo.currentData():
             print(f"[警告] 请求的相机 {cam_id} 与当前选择的不一致")
-        ok, frame = self.capture.read()
-        if not ok or frame is None or frame.size == 0:
-            print("[摄像头] 读取失败")
-            return
+        frame = self.last_frame.copy()
 
         shapes_enabled = {
             s for s, chk in [
@@ -674,16 +735,18 @@ class MainWindow(QtWidgets.QWidget):
     # ------------------- 摄像头 -------------------
     def open_camera(self):
         idx = self.cam_combo.currentData()
-        if idx is None or idx == -1:         # 还在扫描或无设备
+        if idx is None or idx == -1:
             return
-        if self.capture:
-            self.capture.release(); self.capture = None
-        self.capture = cv2.VideoCapture(idx,cv2.CAP_MSMF)
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        if self.worker:
+            self.worker.stop()
+            self.worker = None
+        self.worker = CameraWorker(idx, self.cam_backend)
+        self.worker.frame_ready.connect(self.on_frame)
+        self.worker.start()
         self.frame_cnt = 0
         self.last_time = time.time()
         self.fps = 0.0
+        self.last_frame = None
     # ------------------- 掩膜窗口 -------------------
     def toggle_mask(self, name: str):
         if name in self.mask_windows and self.mask_windows[name].isVisible():
@@ -693,23 +756,24 @@ class MainWindow(QtWidgets.QWidget):
             self.mask_windows[name].destroyed.connect(lambda _, n=name: self.mask_windows.pop(n, None))
         self.mask_windows[name].show(); self.mask_windows[name].raise_(); self.mask_windows[name].activateWindow()
     # ------------------- 主循环 -------------------
-    def on_timer(self):
-        if not self.capture or not self.capture.isOpened():
+    @QtCore.pyqtSlot(object)
+    def on_frame(self, frame):
+        if frame is None or frame.size == 0:
             return
-        ok, frame = self.capture.read()
-        if not ok or frame is None or frame.size == 0:
-            return
+        self.last_frame = frame.copy()
         self.frame_cnt += 1
         if self.frame_cnt % self.FPS_CALC_INTERVAL == 0:
             now = time.time()
             self.fps = self.FPS_CALC_INTERVAL / (now - self.last_time)
             self.last_time = now
         # --------  形状检测 --------
-        shapes_enabled = { s for s, chk in [
-            ("circle",   self.chk_circle),
-            ("triangle", self.chk_tri),
-            ("rect",     self.chk_rect)
-        ] if chk.isChecked() }
+        shapes_enabled = {
+            s for s, chk in [
+                ("circle", self.chk_circle),
+                ("triangle", self.chk_tri),
+                ("rect", self.chk_rect),
+            ] if chk.isChecked()
+        }
         labels = detect_shapes(frame, list(self.colors.values()), shapes_enabled)
         # --- 掩膜窗口更新 ---
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -722,18 +786,18 @@ class MainWindow(QtWidgets.QWidget):
                     except Exception as e:
                         print(f"[掩膜更新失败] {cfg.name}: {e}")
 
-        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, channels = rgb.shape
         qimg = QtGui.QImage(rgb.data, w, h, channels * w, QtGui.QImage.Format_RGB888)
-        pix  = QtGui.QPixmap.fromImage(qimg)
+        pix = QtGui.QPixmap.fromImage(qimg)
         # --------  用 QPainter 叠中文 --------
         painter = QtGui.QPainter(pix)
         painter.setFont(QtGui.QFont("微软雅黑", 16, QtGui.QFont.Bold))
         for text, (tx, ty), qcol in labels:
             painter.setPen(qcol)
             painter.drawText(tx, ty, text)
-                        # === 根据配置和勾选框决定是否发送 ===
-            key = text   # text 形如 "红色-圆形"
+            # === 根据配置和勾选框决定是否发送 ===
+            key = text  # text 形如 "红色-圆形"
             if self.auto_send_chk.isChecked() and self.tcp_sender:
                 if key in self.cmd_map:
                     msg = self.cmd_map[key]
@@ -742,11 +806,18 @@ class MainWindow(QtWidgets.QWidget):
                 else:
                     print(f"[未配置] {key}")
         painter.end()
-        self.video_lbl.setPixmap(pix.scaled(self.video_lbl.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        self.video_lbl.setPixmap(
+            pix.scaled(
+                self.video_lbl.size(),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
+        )
 
     def closeEvent(self, e):
-        if self.capture:
-            self.capture.release(); self.capture = None
+        if self.worker:
+            self.worker.stop()
+            self.worker = None
         if self.svr:
             try:
                 self.svr.shutdown()
